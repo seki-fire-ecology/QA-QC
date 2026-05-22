@@ -1,0 +1,1666 @@
+---
+title: "QAQC All Protocols"
+author: "Sophie Dua, Jacob Davison"
+date: "2026-04-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading packages
+
+Setting up R and installing packages (as needed). Make sure to always load appropriate packages.
+
+```{r}
+#find working directory
+getwd()
+
+#Install packages if you need
+# install.packages("tidyverse")
+# install.packages("dplyr")
+# install.packages("writexl")
+# install.packages("EnvStats")
+# install.packages("janitor")
+
+#load packages !Very important!
+# tidyverse and dplyr have lots of useful functions for data cleaning
+library(tidyverse)
+library(dplyr)
+# writexl is used to create excel files from within R
+library(writexl)
+# knitr is used to create output files from R Markdown
+library(knitr)
+# EnvStats is needed for the rosnerTest() function
+library(EnvStats)
+# janitor needed for get_dupes()
+library(janitor)
+```
+
+## Loading data: Paste all file paths here!
+
+Load all the appropriate .csv files that we want to QAQC. Title each protocol dataset and adjust file paths.
+
+```{r}
+#load data 
+Fuels_FWD<- read.csv("/Users/sophiedua/Desktop/SEKI Winter Fellowship/R/2026 SEKI Winter Fellows/data/Surface Fuels - Fine_XPT.csv")
+
+Fuels_1000HR<- read.csv("/Users/sophiedua/Desktop/SEKI Winter Fellowship/R/2026 SEKI Winter Fellows/data/Surface Fuels - 1000Hr_XPT.csv")
+
+Fuels_LittDuff<- read.csv("/Users/sophiedua/Desktop/SEKI Winter Fellowship/R/2026 SEKI Winter Fellows/data/Surface Fuels - Duff_Litter_XPT.csv")
+
+Post_Burn <- read.csv("/Users/sophiedua/Desktop/SEKI Winter Fellowship/R/2026 SEKI Winter Fellows/data/Post Burn Severity (metric)_XPT.csv")
+
+Seedlings <- read.csv("/Users/sophiedua/Desktop/SEKI Winter Fellowship/R/2026 SEKI Winter Fellows/data/Density - Quadrats (metric)_XPT.csv")
+
+Trees<- read.csv("/Users/sophiedua/Desktop/SEKI Winter Fellowship/R/2026 SEKI Winter Fellows/data/Trees - Individuals (metric)_XPT.csv")
+
+```
+
+## Clean up the data
+
+This code cleans up the data a little more by making the date/year and plot info more readable.
+
+```{r}
+# Clean up data frame
+df_names <- c("Fuels_FWD", "Fuels_1000HR", "Fuels_LittDuff", "Post_Burn", "Seedlings", "Trees")
+
+for (name in df_names)
+  
+{current_df <- get(name) %>%
+  # Separate Date column into Date and Time columns
+  separate(Date, sep = " ", into = c("Date", "Time")) %>%
+  separate(Date, sep = "/", into = c("Month", "Day", "Year"), remove = FALSE) %>% 
+  select(!c("Month", "Day")) %>% 
+  # Separate MacroPlotName to get Monitoring type and plot number
+  separate(
+    MacroPlot.Name,
+    into = c("Drop", "MonitoringType", "Plot"),
+    sep = ":",
+    remove = FALSE
+  ) %>%
+  #delete any blank spaces in our character variables using trimws()
+  mutate(across(where(is.character), ~na_if(trimws(.x), ""))) %>%
+  
+  select(-Drop)
+
+# Ensure blanks in Visited column are filled in as NA
+current_df$Visited[current_df$Visited==""] <- NA
+
+# Convert to Date with explicit format
+# Change %m/%d/%Y to whatever your CSV actually uses. For FFI it outputs as %m/%d/%Y
+current_df$Date <- as.Date(current_df$Date, format = "%m/%d/%Y")
+
+assign(name, current_df)
+}
+```
+
+Separate header data from other data for each protocol.
+
+```{r}
+# Filter for only data into a new data frames
+FuelsFWD_data <- Fuels_FWD %>% filter(is.na(Visited))
+Fuels1000_data <- Fuels_1000HR %>% filter(is.na(Visited))
+Fuels_LittDuff_Data <- Fuels_LittDuff %>% filter(is.na(Visited))
+Post_Burn_data <- Post_Burn %>% filter(is.na(Visited))
+Seedlings_Data <- Seedlings %>% filter(is.na(Visited))
+Trees_data <- Trees %>%filter(is.na(Visited))
+
+
+# Filter for only headers in a different data frames
+FuelsFWD_header <- Fuels_FWD %>% filter(!is.na(Visited))
+Fuels1000_header <- Fuels_1000HR %>% filter(!is.na(Visited))
+Fuels_LittDuff_Header <- Fuels_LittDuff %>% filter(!is.na(Visited))
+Post_Burn_header <- Post_Burn %>% filter(!is.na(Visited))
+Seedlings_Header <- Seedlings %>% filter(!is.na(Visited))
+Trees_header <-Trees %>%filter(!is.na(Visited))
+
+```
+
+## Create a blank error log
+
+This error log data frame will be filled in as we run the qa/qc function unless no errors are present.
+
+```{r}
+# Blank data frame for no errors
+errors_blank <- data.frame("SavedQuery" = "",
+                           "MacroPlot.Name" = "",
+                           "Date" = as.Date(NA),
+                           "Error" = "No Error",
+                           "Comment" = "")
+```
+
+## Create QA/QC function
+
+This function needs four variable inputs to operate: data, query, query_message, and values_check. The output of this function is a complete error log.
+
+Values_check should be a string of T/F statements. A FALSE value will be read as an error and flagged. An NA value will be set to FALSE and also flagged as an error. Errors are also consolidated by plot and date to make the error logs more readable.
+
+```{r}
+
+# Create error group. Duplicate errors will be grouped by these columns.
+errors_group <- c("SavedQuery", "MacroPlot.Name", "Date", "Error")
+
+# QAQC function
+qaqc <- function(data, query, query_message, values_check) {
+  
+  # Check if there is data to QAQC
+  if(nrow(data) == 0) {
+    # If there is no data, default to "No Error" data frame
+    errors <- errors_blank %>%
+      mutate("SavedQuery" = query,
+             "Error" = "No Error")
+    # If there is data, perform error check
+  } else {
+    
+    # Use relevant dataset to look for errors
+    errors <- data %>%
+      # Add columns relevant to error checking
+      # Populate the "SavedQuery" column with the query name
+      mutate("SavedQuery" = query,
+             # Populate the "Error" column with the query message and relevant data
+             "Error" = paste(query_message, "=", values_data),
+            ) %>%
+      
+      # Filter for data which is "false" (data does not match valid conditions)
+      # NA values are treated as "false" (missing data is not valid)
+      filter(!(values_check %>% replace_na(FALSE))) %>%
+      # Select relevant columns to view errors
+      select(colnames(errors_blank))
+    
+    # Next, check if there are duplicate errors
+    errors_temp <- errors %>%
+      get_dupes(all_of(errors_group))
+    # Merge duplicate errors
+    errors <- unique(merge(errors, errors_temp, all = T))
+    # If duplicate errors exist, add number of duplicates to error message
+    errors <- errors %>%
+      mutate(Error = ifelse(is.na(dupe_count), Error, paste0("(x", dupe_count, ") ", Error))) %>%
+      select(!"dupe_count")
+  }
+  
+  # Check if there are no errors
+  if (nrow(errors) == 0) {
+    # If there are no errors, default to "No Error" data frame
+    errors <- errors_blank %>%
+      mutate(SavedQuery = query,
+             Error = "No Error")
+    # If there are errors, keep error log you just created
+  } else {
+    errors <- errors
+  }}
+```
+
+## Begin checking for errors protocol by protocol...
+
+## FUELS FWD ERROR CHECKS
+
+#### Header Metadata:
+
+Number of Transects (NumTran) = 4 and Transect Number (TransNum) = 1, 2, 3, or 4
+
+```{r}
+
+# NumTran
+# Set parameters  for the QAQC function
+
+# Load the data frame containing the "FuelsFWD" header information
+data <- FuelsFWD_header
+# Define a descriptive string for the query related to the number of transects
+query <- "Fuel FWD Header NumTran"
+# Set a message to indicate what aspect is being checked
+query_message <- "Number of Transects" 
+# Extract the "NumTran" column from the data frame into a variable for checking
+values_data <- data$NumTran
+# Define the valid number of transects expected in the data
+values_valid <- 4
+# create a logical vector (T,T,F,T...etc.)indicating which rows meet the valid transect condition
+values_check <- values_data == values_valid
+
+# Identify errors by calling the QAQC function and store the results
+errors_FuelsFWD_NumTran <- qaqc(data, query, query_message, values_check)
+
+
+# TranNum
+#Set parameters
+data <- FuelsFWD_data
+query <- "Fuel FWD Values TransNum"
+query_message <- "Transect Number"
+values_data <- data$Transect
+values_valid <- c(1, 2, 3, 4)
+values_check <- values_data %in% values_valid
+
+#Identify errors
+errors_FuelsFWD_TransNum <- qaqc(data, query, query_message, values_check)
+
+```
+
+Transect length (TranLen): 1Hr = 6, 10Hr = 6, 100Hr = 12
+
+```{r}
+# Start with 1HR transect length 
+# Set parameters
+data <- FuelsFWD_header
+query <- "Fuel FWD Header 1HR TranLen" 
+query_message <- "1HR Transect Length " 
+values_data <- data$OneHrTranLen 
+values_valid <- 6 
+values_check <- values_data == values_valid
+
+#Identify errors
+errors_FuelsFWD_1HR_TranLen <- qaqc(data, query, query_message, values_check)
+
+
+# 10HR transect length 
+# Set parameters
+data <- FuelsFWD_header
+query <- "Fuel FWD Header 10HR TranLen" 
+query_message <- "10HR Transect Length " 
+values_data <- data$TenHrTranLen 
+values_valid <- 6 
+values_check <- values_data == values_valid
+
+#Identify errors
+errors_FuelsFWD_10HR_TranLen <- qaqc(data, query, query_message, values_check)
+
+
+# 100HR transect length
+# Set parametrs
+data <- FuelsFWD_header
+query <- "Fuel FWD Header 100HR TranLen" 
+query_message <- "100HR Transect Length " 
+values_data <- data$HunHrTranLen 
+values_valid <- 12 
+values_check <- values_data == values_valid
+
+#Identify errors
+errors_FuelsFWD_100HR_TranLen <- qaqc(data, query, query_message, values_check)
+
+```
+
+Slope values are reasonable.
+
+```{r}
+# Set parameters
+data <- FuelsFWD_data
+query <- "Fuel FWD Values Slope"
+query_message <- "Slope"
+values_data <- data$Slope
+values_valid <- seq(0, 90, by = 1)
+values_check <- (values_data %in% values_valid) %>% replace_na(TRUE)
+
+# Identify errors
+errors_FuelsFWD_Slope <- qaqc(data, query, query_message, values_check)
+
+```
+
+Azimuth values are between 0 and 360.
+
+```{r}
+# Set parameters
+data <- FuelsFWD_data
+query <- "Fuel FWD Values Azimuth"
+query_message <- "Azimuth"
+values_data <- data$Azimuth
+values_valid <- seq(0, 360)
+values_check <- (values_data %in% values_valid) %>% replace_na(TRUE)
+
+#Identify errors
+errors_FuelsFWD_Azimuth <- qaqc(data, query, query_message, values_check)
+
+```
+
+Check that fuels counts are postitive integer values, and reasonable using a Rosner's outliers test.
+
+1HR:
+
+```{r}
+
+# Filter all data to remove NA values for outlier test
+data_temp <- Fuels_FWD %>%
+  filter(is.na(Visited)) %>% 
+  filter(!is.na(OneHr))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$OneHr)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_OneHr <- min(outliers) - 1
+
+# Set parameters
+data <- FuelsFWD_data
+query <- "Fuel FWD Values OneHr"
+query_message <- "OneHr"
+values_data <- data$OneHr
+values_valid <- seq(0, max_OneHr, by = 1)
+values_check <- !is.na(values_data) & values_data >= 0 & values_data <= max_OneHr
+
+
+# Identify errors
+errors_FuelsFWD_OneHr <- qaqc(data, query, query_message, values_check)
+```
+
+10HR:
+
+```{r}
+
+# Filter all data to remove NA values for outlier test
+data_temp <- Fuels_FWD %>%
+  filter(is.na(Visited)) %>% 
+  filter(!is.na(TenHr))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$TenHr)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_TenHr <- min(outliers) - 1
+
+# Set parameters
+data <- FuelsFWD_data
+query <- "Fuel FWD Values TenHr"
+query_message <- "TenHr"
+values_data <- data$TenHr
+values_valid <- seq(0, max_TenHr, by = 1)
+values_check <- !is.na(values_data) & values_data >= 0 & values_data <= max_TenHr
+
+
+# Identify errors
+errors_FuelsFWD_TenHr <- qaqc(data, query, query_message, values_check)
+```
+
+100HR:
+
+```{r}
+
+# Filter all data to remove NA values for outlier test
+data_temp <- Fuels_FWD %>%
+  filter(is.na(Visited)) %>% 
+  filter(!is.na(HunHr))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$HunHr)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_HunHr <- min(outliers) - 1
+
+# Set parameters
+data <- FuelsFWD_data
+query <- "Fuel FWD Values HunHr"
+query_message <- "HunHr"
+values_data <- data$HunHr
+values_valid <- seq(0, max_HunHr, by = 1)
+values_check <- !is.na(values_data) & values_data >= 0 & values_data <= max_HunHr
+
+# Identify errors
+errors_FuelsFWD_HunHr <- qaqc(data, query, query_message, values_check)
+```
+
+## Fuels FWD Error Log
+
+```{r}
+# Save to master error list
+errors_FuelsFWD <- rbind(errors_FuelsFWD_TransNum, errors_FuelsFWD_NumTran, errors_FuelsFWD_1HR_TranLen, errors_FuelsFWD_10HR_TranLen, errors_FuelsFWD_100HR_TranLen, errors_FuelsFWD_Slope, errors_FuelsFWD_Azimuth, errors_FuelsFWD_OneHr, errors_FuelsFWD_TenHr, errors_FuelsFWD_HunHr)
+```
+
+```{r}
+#remove all the error data frames
+remove(errors_FuelsFWD_TransNum, errors_FuelsFWD_NumTran, errors_FuelsFWD_1HR_TranLen, errors_FuelsFWD_10HR_TranLen, errors_FuelsFWD_100HR_TranLen, errors_FuelsFWD_Slope, errors_FuelsFWD_Azimuth, errors_FuelsFWD_OneHr, errors_FuelsFWD_TenHr, errors_FuelsFWD_HunHr)
+```
+
+## FUELS 1000S ERROR CHECKS
+
+#### Header Metadata
+
+Number of transects (NumTran) = 4
+
+```{r}
+# Set parameters  for the QAQC function
+
+# Load the data frame containing the "1000 Fuel" header information
+data <- Fuels1000_header
+# Define a descriptive string for the query related to the number of transects
+query <- "Fuel 1000 Header NumTran"
+# Set a message to indicate what aspect is being checked
+query_message <- "Number of Transects" 
+# Extract the "NumTran" column from the data frame into a variable for checking
+values_data <- data$NumTran
+# Define the valid number of transects expected in the data
+values_valid <- 4
+# create a logical vector (T,T,F,T...etc.)indicating which rows meet the valid transect condition
+values_check <- values_data == values_valid
+
+# Identify errors by calling the QAQC function and store the results
+errors_Fuels1000_NumTran <- qaqc(data, query, query_message, values_check)
+
+```
+
+Transect length (TranLen) = 50
+
+```{r}
+# Set parameters 
+data <- Fuels1000_header
+query <- "Fuel 1000 Header TranLen" 
+query_message <- "Transect Length" 
+values_data <- data$TranLen 
+values_valid <- 50  
+values_check <- values_data == values_valid
+
+
+# Identify errors
+errors_Fuels1000_TranLen <- qaqc(data, query, query_message, values_check)
+
+```
+
+#### 1000s Fuels Data
+
+Decay class (DecayCl) = 3 or 4
+
+```{r}
+# Set parameters
+data <- Fuels1000_data
+query <- "Fuel 1000 DecayClass"
+query_message <- "Decay Class"
+values_data <- data$DecayCl
+values_valid <- c(3,4)
+values_check <- values_data %in% values_valid
+
+# Identify errors
+errors_Fuels1000_DecayCl <- qaqc(data, query, query_message, values_check)
+
+```
+
+Transect number (TransNum) = 1, 2, 3, or 4
+
+```{r}
+# Set parameters
+data <- Fuels1000_data
+query <- "Fuel 1000 Values TransNum"
+query_message <- "Transect Number"
+values_data <- data$Transect
+values_valid <- c(1, 2, 3, 4)
+values_check <- values_data %in% values_valid
+
+# Identify errors
+errors_Fuels1000_TransNum <- qaqc(data, query, query_message, values_check)
+
+```
+
+Slope values are reasonable.
+
+```{r}
+# Set parameters
+data <- Fuels1000_data
+query <- "Fuel 1000 Values Slope"
+query_message <- "Slope"
+values_data <- data$Slope
+values_valid <- seq(0, 90, by = 1)
+values_check <- (values_data %in% values_valid) %>% replace_na(TRUE)
+
+# Identify errors
+errors_Fuels1000_Slope <- qaqc(data, query, query_message, values_check)
+```
+
+Diameter values are reasonable: not an outlier based on a Rosner's test and ≥ 3.0.
+
+```{r}
+# Perform Rosner's Test for outliers.
+# This test is most appropriate when the sample size is large (n > 20). 
+
+# Filter all data to remove NA values for outlier test
+data_temp <- Fuels_1000HR %>%
+  filter(is.na(Visited)) %>% 
+  filter(!is.na(Dia))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$Dia)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_Dia <- min(outliers) - 1
+
+# Set parameters
+data <- Fuels1000_data
+query <- "Fuel 1000 Values Dia"
+query_message <- "Diameter"
+values_data <- data$Dia
+values_valid <- seq(3, max_Dia)
+values_check <- !is.na(values_data) & values_data >= 3 & values_data <= max_Dia
+
+# Identify errors
+errors_Fuels1000_Dia <- qaqc(data, query, query_message, values_check)
+```
+
+## Fuels 1000s Error Log
+
+```{r}
+# Save to master error list
+errors_Fuels1000 <- rbind(errors_Fuels1000_DecayCl, errors_Fuels1000_NumTran, errors_Fuels1000_TranLen, errors_Fuels1000_TransNum, errors_Fuels1000_Slope, errors_Fuels1000_Dia)
+```
+
+```{r}
+#remove all the error data frames
+remove(errors_Fuels1000_DecayCl, errors_Fuels1000_NumTran, errors_Fuels1000_TranLen, errors_Fuels1000_TransNum, errors_Fuels1000_Slope, errors_Fuels1000_Dia)
+```
+
+## LITTER & DUFF ERROR CHECKS
+
+#### Header Metadata:
+
+Number of Transects = 4
+
+```{r}
+# Load the data frame containing the "Fuels_LittDuff" header information
+data <- Fuels_LittDuff_Header
+# Define a descriptive string for the query related to the number of transects
+query <- "Fuel LittDuff Header NumTran"
+# Set a message to indicate what aspect is being checked
+query_message <- "Number of Transects" 
+# Extract the "NumTran" column from the data frame into a variable for checking
+values_data <- data$NumTran
+# Define the valid number of transects expected in the data
+values_valid <- 4
+# create a logical vector indicating which rows meet the valid transect condition
+values_check <- trimws(values_data) == values_valid
+
+# Identify errors by calling the QAQC function and store the results
+errors_Fuels_LittDuff_NumTran <- qaqc(data, query, query_message, values_check)
+```
+
+Transect Number = 1, 2, 3, or 4
+
+```{r}
+# Set parameters
+data <- Fuels_LittDuff_Data
+query <- "Fuel LittDuff Values TransNum"
+query_message <- "Transect Number"
+values_data <- data$Transect
+values_valid <- c(1, 2, 3, 4)
+values_check <- trimws(values_data) %in% values_valid
+
+# Identify errors
+errors_Fuels_LittDuff_TransNum <- qaqc(data, query, query_message, values_check)
+```
+
+Sample Location = 1, 5, 10, 15, 20, 25, 30, 35, 40, 45
+
+```{r}
+#Set parameters
+data <- Fuels_LittDuff_Data
+query <- "Sample Location on Transect"
+query_message <- "Sample location"
+values_data <- data$SampLoc
+values_valid <- c(1, 5, 10, 15, 20, 25, 30, 35, 40, 45)
+values_check <- (values_data) %in% values_valid
+
+#Identify errors
+errors_Fuels_LittDuff_SampLoc <- qaqc(data, query, query_message, values_check)
+
+```
+
+Also flag plots where zero values are found for both Duff and Litt at Sample locations 5, 15, 25, 35. These zeros are likely errors from pre-1992 when the protocol was changed and should be NA.
+
+```{r}
+#Set parameters
+data <- Fuels_LittDuff_Data
+query <- "Fuel LittDuff SampLoc; False Zeros"
+query_message <- paste0("Litter=", data$LittDep, " Duff=", data$DuffDep, " at SampLoc")
+values_data <- data$SampLoc
+values_check <- data %>%
+  group_by(Plot, Date) %>%
+  mutate(
+    flag =
+      all(c(5,15,25,35) %in% SampLoc) &
+      all(
+        DuffDep[SampLoc %in% c(5,15,25,35)] == 0 &
+        LittDep[SampLoc %in% c(5,15,25,35)] == 0
+      )
+  ) %>%
+  ungroup() %>%
+  mutate(flag = !flag) %>%
+  pull(flag)
+
+
+# Identify errors
+errors_Fuels_LittDuff_SampLoc_zeros <- qaqc(data, query, query_message, values_check)
+
+```
+
+Litter values are \>= 0 and flags outliers using a Rosner's outlier test.
+
+```{r}
+# Perform Rosner's Test for outliers.
+# This test is most appropriate when the sample size is large (n > 20). 
+
+# Filter all data to remove NA values for outlier test
+data_temp <- Fuels_LittDuff_Data %>%
+  filter(is.na(Visited)) %>% 
+  filter(!is.na(LittDep))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$LittDep)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_Litt <- min(outliers) - 1
+
+# Set parameters
+data <- Fuels_LittDuff_Data
+query <- "Fuel Litt Values"
+query_message <- paste0("Litter value at ", data$SampLoc,"ft")
+values_data <- data$LittDep
+values_valid <- seq(0, max_Litt)
+values_check <- !is.na(values_data) & values_data >= 0 & values_data <= max_Litt
+
+# Identify errors
+errors_Fuels_Litt_Outlier <- qaqc(data, query, query_message, values_check)
+```
+
+Duff values are \>= 0 and flags outliers using a Rosner's outlier test.
+
+```{r}
+# Perform Rosner's Test for outliers.
+# This test is most appropriate when the sample size is large (n > 20). 
+
+# Filter all data to remove NA values for outlier test
+data_temp <- Fuels_LittDuff_Data %>%
+  filter(is.na(Visited)) %>% 
+  filter(!is.na(DuffDep))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$DuffDep)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_Duff <- min(outliers) - 1
+
+# Set parameters
+data <- Fuels_LittDuff_Data
+query <- "Fuel Duff Values"
+query_message <- paste0("Duff value at ", data$SampLoc,"ft")
+values_data <- data$DuffDep
+values_valid <- seq(0, max_Duff)
+values_check <- !is.na(values_data) & values_data >= 0 & values_data <= max_Duff
+
+# Identify errors
+errors_Fuels_Duff_Outlier <- qaqc(data, query, query_message, values_check)
+```
+
+## Litter & Duff Error Log
+
+```{r}
+# Save to master error list
+errors_Fuels_DuffLitt <- rbind(errors_Fuels_Duff_Outlier, errors_Fuels_Litt_Outlier, errors_Fuels_LittDuff_NumTran, errors_Fuels_LittDuff_SampLoc, errors_Fuels_LittDuff_SampLoc_zeros, errors_Fuels_LittDuff_TransNum)
+
+#remove all the error data frames
+remove(errors_Fuels_Duff_Outlier, errors_Fuels_Litt_Outlier, errors_Fuels_LittDuff_NumTran, errors_Fuels_LittDuff_SampLoc, errors_Fuels_LittDuff_SampLoc_zeros, errors_Fuels_LittDuff_TransNum)
+
+```
+
+## POST BURN ERROR CHECKS
+
+#### Header Metadata:
+
+Number of transects (NumTran) = 4
+
+```{r}
+# Set parameters  for the QAQC function
+
+# Load the data frame containing the "Post Burn" header information
+data <- Post_Burn_header
+# Define a descriptive string for the query related to the number of transects
+query <- "Post Burn Header NumTran"
+# Set a message to indicate what aspect is being checked
+query_message <- "Number of Transects" 
+# Extract the "NumTran" column from the data frame into a variable for checking
+values_data <- data$NumTran
+# Define the valid number of transects expected in the data
+values_valid <- 4
+# create a logical vector indicating which rows meet the valid transect condition
+values_check <- trimws(values_data) == values_valid
+
+# Identify errors by calling the QAQC function and store the results
+errors_PostBurn_NumTran <- qaqc(data, query, query_message, values_check)
+
+```
+
+Transect length (TranLen) = 50ft
+
+```{r}
+# Set parameters 
+data <- Post_Burn_header
+query <- "Post Burn Header TranLen" 
+query_message <- "Transect Length" 
+values_data <- as.numeric(data$TranLen)
+values_valid <- c(50) 
+values_check <- values_data %in% values_valid
+
+
+# Identify errors
+errors_PostBurn_TranLen <- qaqc(data, query, query_message, values_check)
+
+```
+
+Transect number (TransNum) = 1, 2, 3, or 4
+
+```{r}
+# Set parameters
+data <- Post_Burn_data
+query <- "Post Burn Values TransNum"
+query_message <- "Transect Number"
+values_data <- as.numeric(data$Transect)
+values_valid <- c(1, 2, 3, 4)
+values_check <- values_data %in% values_valid
+
+# Identify errors
+errors_PostBurn_TransNum <- qaqc(data, query, query_message, values_check)
+
+```
+
+Number of points on the transect = 10
+
+```{r}
+# Set parameters 
+data <- Post_Burn_header
+query <- "Post Burn Header NumPtsTran" 
+query_message <- "Number of Points on Transect" 
+values_data <- as.numeric(data$NumPtsTran)
+values_valid <- 10 
+values_check <- values_data == values_valid
+
+
+# Identify errors
+errors_PostBurn_NumPtsTran <- qaqc(data, query, query_message, values_check)
+
+```
+
+Tape distance = 1, 5, 10, 15, 20, 25, 30, 35, or 40
+
+```{r}
+# Set parameters
+data <- Post_Burn_data
+query <- "Post Burn Values TapeDist"
+query_message <- "Tape Distance"
+values_data <- as.numeric(data$TapeDist)
+values_valid <- c(1, 5, 10, 15, 20, 25, 30, 35, 40, 45)
+values_check <- values_data %in% values_valid
+
+# Identify errors
+errors_PostBurn_TapeDist <- qaqc(data, query, query_message, values_check)
+
+```
+
+#### Post Burn Data
+
+Check that Veg = 0, 1, 2, 3, 4, or 5
+
+```{r}
+# Set parameters
+data <- Post_Burn_data
+query <- "Post Burn Values Veg"
+query_message <- "Veg"
+values_data <- as.numeric(data$Veg)
+values_valid <- c(0, 1, 2, 3, 4, 5)
+values_check <- values_data %in% values_valid
+
+# Identify errors
+errors_PostBurn_Veg <- qaqc(data, query, query_message, values_check)
+
+```
+
+Check that Sub = 0, 1, 2, 3, 4, or 5
+
+```{r}
+# Set parameters
+data <- Post_Burn_data
+query <- "Post Burn Values Sub"
+query_message <- "Sub"
+values_data <- as.numeric(data$Sub)
+values_valid <- c(0, 1, 2, 3, 4, 5)
+values_check <- values_data %in% values_valid
+
+# Identify errors
+errors_PostBurn_Sub <- qaqc(data, query, query_message, values_check)
+
+```
+
+## Post Burn Error Log
+
+```{r}
+# Save to master error list
+errors_PostBurn <- rbind(errors_PostBurn_NumTran, errors_PostBurn_TranLen, errors_PostBurn_TransNum, errors_PostBurn_NumPtsTran, errors_PostBurn_TapeDist, errors_PostBurn_Veg, errors_PostBurn_Sub)
+```
+
+```{r}
+#remove all the error data frames
+remove(errors_PostBurn_NumTran, errors_PostBurn_TranLen, errors_PostBurn_TransNum, errors_PostBurn_NumPtsTran, errors_PostBurn_TapeDist, errors_PostBurn_Veg, errors_PostBurn_Sub)
+```
+
+## SEEDLINGS ERROR CHECKS
+
+#### Header Metadata:
+
+Number of Transects = 1
+
+```{r}
+# Set parameters  for the QAQC function
+
+# Load the data frame containing the "Seedlings" header information
+data <- Seedlings_Header
+# Define a descriptive string for the query related to the number of transects
+query <- "Seedlings Transect"
+# Set a message to indicate what aspect is being checked
+query_message <- "Transect Number" 
+# Extract the "NumTran" column from the data frame into a variable for checking
+values_data <- data$NumTran
+# Define the valid transect number expected in the data
+values_valid <- 1
+# create a logical vector (T,T,F,T...etc.)indicating which rows meet the valid transect condition
+values_check <- values_data == values_valid
+
+# Identify errors by calling the QAQC function and store the results
+errors_Seedlings_Transect <- qaqc(data, query, query_message, values_check)
+```
+
+Quadrat Number = 1
+
+```{r}
+# Set parameters
+data <- Seedlings_Header
+query <- "Seedlings Quadrat"
+query_message <- "Quadrat Number" 
+values_data <- data$NumQuadTran
+values_valid <- 1
+values_check <- values_data == values_valid
+
+#Identify errors
+errors_Seedlings_Quadrat <- qaqc(data, query, query_message, values_check)
+```
+
+Quadrat Length = 10 or 25 and is not the same value as Quadrat Width
+
+```{r}
+#Set parameters
+data <- Seedlings_Header
+query <- "Quadrat Length"
+query_message <- "Length of Area Sampled"
+values_data <- data$QuadLen
+values_valid <- c(10, 25)
+values_check <-
+  values_data %in% values_valid & 
+  !(values_data == data$QuadWid)
+
+#Identify errors
+errors_Seedlings_length <- qaqc(data, query, query_message, values_check)
+```
+
+Quadrat Width = 10 or 25
+
+```{r}
+#Set parameters
+data <- Seedlings_Header
+query <- "Quadrat Width"
+query_message <- "Width of Area Sampled"
+values_data <- data$QuadWid
+values_valid <- c(10, 25)
+values_check <- values_data %in% values_valid
+
+#Identify errors
+errors_Seedlings_width <- qaqc(data, query, query_message, values_check)
+```
+
+Quadrat Area = 250
+
+```{r}
+#Set parameters
+data <- Seedlings_Header
+query <- "Quadrat Area"
+query_message <- "Area sampled"
+values_data <- data$Area
+values_valid <- 250
+values_check <- values_data == values_valid
+
+#Identify errors
+errors_Seedlings_area <- qaqc(data, query, query_message, values_check)
+```
+
+Seedling Count error = 9999
+
+Counts above 10,000 were auto-listed as 9999 in FFI at one time. Essentially, FFI was not able to compute a value higher than that, so values of 9999 should be flagged
+
+```{r}
+#Set parameters
+data <- Seedlings_Data
+query <- "Seedling Count"
+query_message <- "Seedling Count 9999 Error"
+values_data <- as.numeric(data$Count)
+values_valid <-  values_data >= 0 &
+                values_data != 9999 &
+                values_data == floor(values_data)
+values_check <- values_valid
+
+#Identify errors
+errors_Seedlings_count <- qaqc(data, query, query_message, values_check)
+```
+
+Seedling Height Class = 0.15, 0.3, 0.6, 1, or 2
+
+```{r}
+#Set parameters
+data <- Seedlings_Data
+query <- "Size Height"
+query_message <- "Height Class of Seedlings"
+values_data <- data$Height
+values_valid <- c(0.15, 0.3, 0.6, 1, 2)
+values_check <- values_data %in% values_valid
+
+#Identify errors
+errors_Seedling_height <- qaqc(data, query, query_message, values_check)
+```
+
+## Seedlings Error Log
+
+```{r}
+# Save to master error list
+errors_Seedlings <- rbind(errors_Seedling_height, errors_Seedlings_area, errors_Seedlings_count, errors_Seedlings_Quadrat, errors_Seedlings_Transect, errors_Seedlings_length, errors_Seedlings_width)
+
+#remove all the error data frames
+remove(errors_Seedling_height, errors_Seedlings_area, errors_Seedlings_count, errors_Seedlings_Quadrat, errors_Seedlings_Transect, errors_Seedlings_length, errors_Seedlings_width)
+```
+
+## TREES ERROR CHECKS
+
+#### Header Metadata:
+
+Macroplot size = 0.1
+
+```{r}
+# Set parameters  for the QAQC function
+
+# Load the data frame containing the "Trees" header information
+data <- Trees_header
+# Define a descriptive string for the query related to the MacroPlot size
+query <- "Trees Header MacroPlot Size" 
+# Set a message to indicate what aspect is being checked
+query_message <- "MacroPlot size" 
+# Extract the "MacroPlotSize" column from the data frame into a variable for checking
+values_data <- as.numeric(data$MacroPlotSize)
+# Define the valid size expected in the data
+values_valid <- 0.1
+# create a logical vector (T,T,F,T...etc.)indicating which rows meet the valid size condition
+values_check <- values_data == values_valid
+
+# Identify errors by calling the QAQC function and store the results
+errors_Trees_MacroPlotSize <- qaqc(data, query, query_message, values_check)
+
+```
+
+Snagplot size = 0.1
+
+```{r}
+
+# Set parameters
+data <- Trees_header
+query <- "Trees Header SnagPlot Size" 
+query_message <- "SnagPlot size" 
+values_data <- as.numeric(data$SnagPlotSize)
+values_valid <- 0.1
+values_check <- values_data == values_valid
+
+#Identify errors
+errors_Trees_SnagPlotSize <- qaqc(data, query, query_message, values_check)
+
+```
+
+Break point diameter = 15
+
+```{r}
+
+#Set parameters
+data <- Trees_header
+query <- "Trees Header Break Point Diameter" 
+query_message <- "Break Point Diameter" 
+values_data <- as.numeric(data$BrkPntDia)
+values_valid <- 15
+values_check <- values_data == values_valid
+
+#Identify errors
+errors_Trees_BrkPntDia <- qaqc(data, query, query_message, values_check)
+```
+
+Field team is filled in
+
+```{r}
+
+#Set parameters
+data <- Trees_header
+query <- "Trees Header Field Team" 
+query_message <- "Field Team" 
+values_data <- data$FieldTeam
+values_valid <- !is.na(values_data)
+values_check <- values_valid
+
+#Identify errors
+errors_Trees_FieldTeam <- qaqc(data, query, query_message, values_check)
+
+```
+
+#### Tree data:
+
+```{r}
+#First defign dead and live CrwnCl so we can sort through them
+dead_classes <- c("DD", "BAD", "BBD", "CUS", "CS", "RS", "LBS")
+live_classes <- c("D", "C", "I", "SC", "O")
+```
+
+Quarter = 1, 2, 3, 4
+
+```{r}
+
+#Set parameters
+data <- Trees_data
+query <- "Valid Quarter Numbers"
+query_message <- paste0("Tag #", data$TagNo,": Quarter Number")
+values_data <- data$QTR
+values_valid <- c(1, 2, 3, 4)
+values_check <- (values_data %in% values_valid)
+
+#Identify errors
+errors_Trees_QTRNum <- qaqc(data, query, query_message, values_check)
+```
+
+Tree Tag is a positive integer
+
+```{r}
+
+#Set parameters
+data <- Trees_data
+query <- "Tree Tag"
+query_message <- "Tree Tag Value"
+values_data <- data$TagNo
+values_valid <- seq(1, 1e6, by = 1)
+values_check <- (values_data %in% values_valid) 
+
+#Identify errors
+errors_Trees_PosTag <- qaqc(data, query, query_message, values_check)
+
+```
+
+Tree status:
+
+```{r}
+
+#Set parameters
+data <- Trees_data
+query <- "Tree Status"
+query_message <- "Tree Status"
+values_data <- data$Status
+values_check <- values_data %in% c("L", "D") 
+
+#Identify errors
+errors_Trees_Status <- qaqc(data, query, query_message, values_check)
+
+```
+
+DBH values are valid. Here we are using a Rosner's outlier test to flag outliers as well as flagging values that are \<0 and have a dead Crown class: DD, BBD, or CUS. We also are separating out SEGIs and running them in a seperate outliers test.
+
+```{r}
+# Perform Rosner's Test for outliers.
+# This test is most appropriate when the sample size is large (n > 20). 
+
+#Separate SEGI and nonSEGI trees
+XSEGI_data <- Trees_data %>%
+  filter(Species.Symbol != "SEGI1")
+
+SEGI_data <- Trees_data %>%
+  filter(Species.Symbol == "SEGI1")
+
+
+#Rosner's for non-SEGIs
+# Filter all data to remove NA values for outlier test
+data_temp <- XSEGI_data %>%
+  filter(!is.na(DBH)) %>%
+  filter(!CrwnCl %in% c("DD", "BBD", "CUS"))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$DBH)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_DBH_XSEGI <- min(outliers) - 1
+
+#Rosner's for only SEGIs
+# Filter all data to remove NA values for outlier test
+data_temp <- SEGI_data %>%
+  filter(!is.na(DBH)) %>%
+  filter(!CrwnCl %in% c("DD", "BBD", "CUS"))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$DBH)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_DBH_SEGI <- min(outliers) - 1
+
+
+# Set parameters for non SEGIs
+data <- XSEGI_data
+query <- "DBH"
+query_message <- case_when(
+  is.na(data$DBH) ~ "DBH",
+  !is.na(data$DBH) & data$DBH > max_DBH_XSEGI ~ paste0("Tag #", data$TagNo, ": DBH (outlier)"),
+  data$CrwnCl %in% c("DD", "CUS", "BBD") ~ paste0("Tag #", data$TagNo, ": DBH (", data$CrwnCl, ")"),
+  TRUE ~ paste0("Tag #", data$TagNo, ": DBH"))
+values_data <- data$DBH
+values_check <- (
+  # Live trees: DBH valid
+  data$CrwnCl %in% live_classes & values_data > 0 & values_data <= max_DBH_XSEGI) |
+(
+  # Dead trees: DBH valid
+  !(data$CrwnCl %in% c("DD", "CUS", "BBD")) & values_data > 0 & values_data <= max_DBH_XSEGI) |
+(
+  # Dead trees DD, CUS, BBD: NA allowed
+  data$CrwnCl %in% c("DD", "CUS", "BBD") & is.na(values_data))
+
+
+# Identify errors for non SEGIs
+errors_Trees_DBH_XSEGI <- qaqc(data, query, query_message, values_check)
+
+
+# Set parameters for SEGIs
+data <- SEGI_data
+query <- "DBH"
+query_message <- case_when(
+  is.na(data$DBH) ~ "DBH",
+  !is.na(data$DBH) & data$DBH > max_DBH_SEGI ~ paste0("Tag #", data$TagNo, ": DBH (outlier)"),
+  data$CrwnCl %in% c("DD", "CUS", "BBD") ~ paste0("Tag #", data$TagNo, ": DBH (", data$CrwnCl, ")"),
+  TRUE ~ paste0("Tag #", data$TagNo, ": DBH"))
+values_data <- data$DBH
+values_check <- (
+  # Live trees: DBH valid
+  data$CrwnCl %in% live_classes & values_data > 0 & values_data <= max_DBH_SEGI) |
+(
+  # Dead trees: DBH valid
+  !(data$CrwnCl %in% c("DD", "CUS", "BBD")) & values_data > 0 & values_data <= max_DBH_SEGI) |
+(
+  # Dead trees DD, CUS, BBD: NA allowed
+  data$CrwnCl %in% c("DD", "CUS", "BBD") & is.na(values_data))
+
+
+# Identify errors for SEGIS
+errors_Trees_DBH_SEGI <- qaqc(data, query, query_message, values_check)
+
+# Combine DBH error logs
+errors_Trees_DBH <- rbind(errors_Trees_DBH_XSEGI, errors_Trees_DBH_SEGI)
+
+# Remove combined logs
+remove(errors_Trees_DBH_XSEGI, errors_Trees_DBH_SEGI)
+```
+
+Height values are valid. Again using a Rosner's outlier test and flagging negative numbers.
+
+```{r}
+# Perform Rosner's Test for outliers.
+# This test is most appropriate when the sample size is large (n > 20). 
+
+# Filter all data to remove NA values for outlier test
+data_temp <- Trees_data %>%
+  filter(!is.na(Ht))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$Ht)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_Ht <- min(outliers) - 1
+
+# Set parameters
+data <- Trees_data
+query <- "Trees Height "
+query_message <- case_when(
+  is.na(data$Ht) ~ "Height",
+  !is.na(data$Ht) & data$Ht > max_Ht ~ paste0("Tag #", data$TagNo, ": Height (outlier)"),
+  data$CrwnCl == "DD" ~ paste0("Tag #", data$TagNo, ": Height (", data$CrwnCl, ")"),
+  TRUE ~ paste0("Tag #", data$TagNo, ": Height")
+)
+values_data <- data$Ht
+values_check <- (
+  # Valid Heights
+  !(data$CrwnCl == "DD") & values_data > 0 & values_data <= max_Ht) |
+(
+  # Dead and Down trees DD: NA allowed
+  data$CrwnCl == "DD" & is.na(values_data))
+
+
+# Identify errors
+errors_Trees_Ht <- qaqc(data, query, query_message, values_check)
+```
+
+Live crown base height values are valid. Rosner's test for outliers, flagging negative values, flagging values that are larger than the height of the tree.
+
+```{r}
+# Perform Rosner's Test for outliers.
+# This test is most appropriate when the sample size is large (n > 20). 
+
+# Filter all data to remove NA values for outlier test
+data_temp <- Trees_data %>%
+  filter(!is.na(LiCrBHt))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$LiCrBHt)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_LiCrBHt <- min(outliers) - 1
+
+# Set parameters
+data <- Trees_data
+query <- "Live Crown Base Height"
+query_message <- case_when(
+  is.na(data$LiCrBHt) ~ "Live Crown Base Height",
+  !is.na(data$LiCrBHt) & data$LiCrBHt > max_LiCrBHt ~ paste0("Tag #", data$TagNo, ": Live Crown Base Height (outlier)"),
+  !is.na(data$LiCrBHt) & data$LiCrBHt > data$Ht ~ paste0("Tag #", data$TagNo, ": Live Crown Base Height > Height"),
+  data$CrwnCl %in% dead_classes ~ paste0("Tag #", data$TagNo, ": Live Crown Base Height (", data$CrwnCl, ")"),
+  TRUE ~ paste0("Tag #", data$TagNo, ": Live Crown Base Height")
+)
+values_data <- data$LiCrBHt
+values_check <- (
+  # Live trees: must have valid value
+  data$CrwnCl %in% live_classes &
+  values_data >= 0 &
+  values_data <= max_LiCrBHt &
+  values_data <= data$Ht
+) |
+(
+  # Dead trees: must be NA
+  data$CrwnCl %in% dead_classes &
+  is.na(values_data)
+)
+
+
+# Identify errors
+errors_Trees_LiCrBHt <- qaqc(data, query, query_message, values_check)
+```
+
+Crown class values are valid. Status must match CPCs:
+
+Live trees = live classes
+
+Dead trees = dead classes
+
+```{r}
+
+#Set parameters
+data <- Trees_data
+query <- "Valid Crown Class"
+query_message <- case_when(
+   (data$Status == "D" & data$CrwnCl %in% live_classes) | (data$Status == "L" & data$CrwnCl %in% dead_classes) 
+      ~ paste0("Tag #", data$TagNo, " (Status ", data$Status,"): Crown Class"),
+   is.na(values_data) | data$CrwnCl %in% c("x","X")
+      ~ "Crown Class",
+   (data$Status == "L" & data$CrwnCl %in% live_classes) | (data$Status == "D" & data$CrwnCl %in% dead_classes)
+      ~ paste0("Tag #", data$TagNo, ": Crown Class"),
+   TRUE ~ "Crown Class"
+)
+values_data <- data$CrwnCl
+values_valid <- c("D", "C", "I", "SC", "RS", "LBS", "CS", "BAD", "BBD", "DD", "CUS", "O")
+values_check <- (values_data %in% values_valid) &
+  (data$Status == "L" & values_data %in% live_classes | 
+     data$Status == "D" & values_data %in% dead_classes)
+
+#Identify errors
+errors_Trees_CrwnCl <- qaqc(data, query, query_message, values_check)
+```
+
+Char height values are valid. Rosner's test for outliers, flagging negative values, flagging values that are larger than the height of the tree.
+
+```{r}
+# Perform Rosner's Test for outliers.
+# This test is most appropriate when the sample size is large (n > 20). 
+
+# Filter all data to remove NA values for outlier test
+data_temp <- Trees_data %>%
+  filter(!is.na(CharHt))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$CharHt)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_CharHt <- min(outliers) - 1
+
+# Set parameters
+data <- Trees_data
+query <- "Trees Values CharHt"
+query_message <- case_when(
+    data$CharHt >= data$Ht ~ paste0("Tag #", data$TagNo, ": Char Height > Height"),
+    data$CharHt >= max_CharHt ~ paste0("Tag #", data$TagNo, "(Outlier): Char Height"),
+    is.na(data$CharHt) ~ "Char Height",
+    is.na(data$Ht) ~ "(Height missing): Char Height",
+    TRUE ~ paste0("Tag #", data$TagNo, ": Char Height")
+    )
+    
+values_data <- data$CharHt
+  # Separate post and non-post
+  is_post <- grepl("Post", data$Monitoring.Status)
+  is_na <- is.na(values_data)
+values_valid <- values_data >= 0 &
+                values_data <= max_CharHt &
+                values_data <= data$Ht
+values_check <- (!is_na & values_valid) |
+                (is_na & !is_post)
+
+
+# Identify errors
+errors_Trees_CharHt <- qaqc(data, query, query_message, values_check)
+```
+
+Scorch height values are valid. Rosner's test for outliers, flagging negative values, flagging values that are larger than the height of the tree.
+
+```{r}
+# Perform Rosner's Test for outliers.
+# This test is most appropriate when the sample size is large (n > 20). 
+
+# Filter all data to remove NA values for outlier test
+data_temp <- Trees_data %>%
+  filter(!is.na(ScorchHt))
+# Perform Rosner test on the valid column values
+data_rosner <- rosnerTest(data_temp$ScorchHt)
+outliers <- data_rosner$all.stats$Value[data_rosner$all.stats$Outlier]
+max_ScorchHt <- min(outliers) - 1
+
+# Set parameters
+data <- Trees_data
+query <- "Trees Values ScorchHt"
+query_message <- query_message <- case_when(
+    data$ScorchHt >= data$Ht ~ paste0("Tag #", data$TagNo, ": Scorch Height > Height"),
+    data$ScorchHt >= max_ScorchHt ~ paste0("Tag #", data$TagNo, "(Outlier): Scorch Height"),
+    is.na(data$ScorchHt) ~ "Scorch Height",
+    is.na(data$Ht) ~ "(Height missing): Scorch Height",
+    TRUE ~ paste0("Tag #", data$TagNo, ": Scorch Height")
+    )
+values_data <- data$ScorchHt
+  # Separate post and non-post
+  is_post <- grepl("Post", data$Monitoring.Status)
+  is_na <- is.na(values_data)
+values_valid <- values_data >= 0 &
+                values_data <= max_ScorchHt &
+                values_data <= data$Ht
+values_check <- (!is_na & values_valid) |
+                (is_na & !is_post)
+
+
+# Identify errors
+errors_Trees_ScorchHt <- qaqc(data, query, query_message, values_check)
+```
+
+Scorch percent valid values are between 0% and 100%.
+
+```{r}
+#Set parameters
+data <- Trees_data
+query <- "Crown Scorch Percent"
+query_message <- "Crown Scorch Percent Value"
+values_data <- data$CrScPct
+  # Separate post and non-post
+  is_post <- grepl("Post", data$Monitoring.Status)
+  is_na <- is.na(values_data)
+values_valid <- 
+  values_data >= 0 &
+  values_data <= 100 
+
+values_check <- (!is_na & values_valid) |
+                (is_na & !is_post)
+  
+#Identify errors
+errors_Trees_CrScPct <- qaqc(data, query, query_message, values_check)
+
+```
+
+#### Damage Codes:
+
+Codes are valid values
+
+```{r}
+#DamCd1
+#Set parameters
+data <- Trees_data
+query <- "Valid Damage Codes"
+query_message <- "Damage Code"
+values_data <- data$DamCd1
+values_valid <- c("ABGR", "BIRD", "BLIG", "BROK", "BROM", "BURL", "CONK", "CROK", "DTOP", "EPIC", "EPIP", "FIRE", "FORK", "FRST", "GALL", "HOLW", "INSE", "LEAN", "LICH", "LIGT", "MAMM", "MISL", "MOSS", "OZON", "ROOT", "ROTT", "SPAR", "SPRT", "TWIN", "UMAN", "WOND")
+values_check <- 
+  is.na(values_data) | 
+  (values_data %in% values_valid)
+
+#Identify errors
+errors_Trees_DamCd1 <- qaqc(data, query, query_message, values_check)
+```
+
+```{r}
+#DamCd2
+#Set parameters
+data <- Trees_data
+query <- "Valid Damage Codes"
+query_message <- "Damage Code"
+values_data <- data$DamCd2
+values_valid <- c("ABGR", "BIRD", "BLIG", "BROK", "BROM", "BURL", "CONK", "CROK", "DTOP", "EPIC", "EPIP", "FIRE", "FORK", "FRST", "GALL", "HOLW", "INSE", "LEAN", "LICH", "LIGT", "MAMM", "MISL", "MOSS", "OZON", "ROOT", "ROTT", "SPAR", "SPRT", "TWIN", "UMAN", "WOND")
+values_check <- 
+  is.na(values_data) |
+  (values_data %in% values_valid)
+
+#Identify errors
+errors_Trees_DamCd2 <- qaqc(data, query, query_message, values_check)
+```
+
+```{r}
+#DamCd3
+#Set parameters
+data <- Trees_data
+query <- "Valid Damage Codes"
+query_message <- "Damage Code"
+values_data <- data$DamCd3
+values_valid <- c("ABGR", "BIRD", "BLIG", "BROK", "BROM", "BURL", "CONK", "CROK", "DTOP", "EPIC", "EPIP", "FIRE", "FORK", "FRST", "GALL", "HOLW", "INSE", "LEAN", "LICH", "LIGT", "MAMM", "MISL", "MOSS", "OZON", "ROOT", "ROTT", "SPAR", "SPRT", "TWIN", "UMAN", "WOND")
+values_check <- 
+  is.na(values_data) | 
+  (values_data %in% values_valid)
+
+#Identify errors
+errors_Trees_DamCd3 <- qaqc(data, query, query_message, values_check)
+```
+
+```{r}
+#DamCd4
+#Set parameters
+data <- Trees_data
+query <- "Valid Damage Codes"
+query_message <- "Damage Code"
+values_data <- data$DamCd4
+values_valid <- c("ABGR", "BIRD", "BLIG", "BROK", "BROM", "BURL", "CONK", "CROK", "DTOP", "EPIC", "EPIP", "FIRE", "FORK", "FRST", "GALL", "HOLW", "INSE", "LEAN", "LICH", "LIGT", "MAMM", "MISL", "MOSS", "OZON", "ROOT", "ROTT", "SPAR", "SPRT", "TWIN", "UMAN", "WOND")
+values_check <- 
+  is.na(values_data) |
+  (values_data %in% values_valid)
+
+#Identify errors
+errors_Trees_DamCd4 <- qaqc(data, query, query_message, values_check)
+```
+
+```{r}
+#DamCd5
+#Set parameters
+data <- Trees_data
+query <- "Valid Damage Codes"
+query_message <- "Damage Code"
+values_data <- data$DamCd5
+values_valid <- c("ABGR", "BIRD", "BLIG", "BROK", "BROM", "BURL", "CONK", "CROK", "DTOP", "EPIC", "EPIP", "FIRE", "FORK", "FRST", "GALL", "HOLW", "INSE", "LEAN", "LICH", "LIGT", "MAMM", "MISL", "MOSS", "OZON", "ROOT", "ROTT", "SPAR", "SPRT", "TWIN", "UMAN", "WOND")
+values_check <- 
+  is.na(values_data) |
+  (values_data %in% values_valid)
+
+#Identify errors
+errors_Trees_DamCd5 <- qaqc(data, query, query_message, values_check)
+```
+
+Combine damage codes for clarity:
+
+```{r}
+# Save to Damage Codes error list
+errors_Trees_DamCds <- rbind(errors_Trees_DamCd1, errors_Trees_DamCd2, errors_Trees_DamCd3, errors_Trees_DamCd4, errors_Trees_DamCd5)
+
+#Remove all the excess DamCd error data frames
+remove(errors_Trees_DamCd1, errors_Trees_DamCd2, errors_Trees_DamCd3, errors_Trees_DamCd4, errors_Trees_DamCd5)
+```
+
+#### Checking for duplicate tags:
+
+Tree tags should not have duplicates withing the same plot. Separate by plot and year to differentiate what is really a duplicate.
+
+```{r}
+#Set parameters
+data <- Trees_data
+query <- "Tree Tags"
+query_message <- "Duplicate Tree tags"
+values_data <- data$TagNo
+values_check <-
+  data %>%
+  group_by(Plot, Date) %>%
+  mutate(values_check = duplicated(TagNo) | duplicated(TagNo, fromLast = TRUE)) %>%
+  ungroup() %>%
+  pull(values_check)
+values_check<- !values_check
+
+#Identify errors
+errors_Trees_DupTag <- qaqc(data, query, query_message, values_check)
+  
+```
+
+#### Tree status change
+
+This data check is looking for trees that are "resurrected", meaning they were marked "D" in one read, and then marked "L" in a later read. The error log shows the status of the tree (L/D) and the trees "death date."
+
+Status Columns:
+
+-   Status_Count = How many unique statuses have been recorded for each individual tree? Count of 1 means that the tree has been alive or dead for the entirety of data collection. Count of 2 means that the tree has been both alive and dead.
+
+-   MinDeadDate = What date was the tree first recorded as Dead?
+
+-   MinLiveDate = What date was the tree first recorded as Live?
+
+```{r}
+#Add a status count column
+Trees_data_CrossYear_Status <- Trees_data %>% 
+  group_by(TagNo, MacroPlot.Name) %>% 
+  mutate(Status_Count = n_distinct(Status)) %>% 
+  ungroup() %>% 
+  arrange(TagNo, MacroPlot.Name, Date)
+#Status counts will be 1, 2, or 3(only if we have an error in status column)
+
+# add min death date to data_temp
+data_temp_Status_AllDead <- Trees_data_CrossYear_Status %>% 
+  filter(Status_Count == 1 & Status == "D")
+data_temp_Status_SomeDead <- Trees_data_CrossYear_Status %>% 
+  filter(Status_Count > 1)
+data_temp_Status_Dead <- rbind(data_temp_Status_AllDead, data_temp_Status_SomeDead)
+
+data_temp_MinDeadDate <- data_temp_Status_Dead %>% 
+  filter(Status == "D") %>% 
+  group_by(TagNo, MacroPlot.Name) %>% 
+  mutate(MinDeadDate = min(Date)) %>% 
+  select(TagNo, MacroPlot.Name, MinDeadDate) %>% 
+  unique()
+
+data_temp_merge_Status_Dead <- merge(data_temp_Status_Dead, data_temp_MinDeadDate, all = T)
+
+# add min live date to data_temp
+data_temp_Status_AllLive <- Trees_data_CrossYear_Status %>% 
+  filter(Status_Count == 1 & Status == "L")
+data_temp_Status_SomeLive <- Trees_data_CrossYear_Status %>% 
+  filter(Status_Count > 1)
+data_temp_Status_Live <- rbind(data_temp_Status_AllLive, data_temp_Status_SomeLive)
+
+data_temp_MinLiveDate <- data_temp_Status_Live %>% 
+  filter(Status == "L") %>% 
+  group_by(TagNo, MacroPlot.Name) %>% 
+  mutate(MinLiveDate = min(Date)) %>% 
+  select(TagNo, MacroPlot.Name, MinLiveDate) %>% 
+  unique()
+
+data_temp_merge_Status_Live <- merge(data_temp_Status_Live, data_temp_MinLiveDate, all = T)
+
+# merge
+data_temp_merge_Status <- merge(data_temp_merge_Status_Dead, data_temp_merge_Status_Live, all = T)
+
+remove(Trees_data_CrossYear_Status, data_temp_Status_AllDead, data_temp_Status_SomeDead, data_temp_Status_Dead, data_temp_MinDeadDate, data_temp_merge_Status_Dead, data_temp_Status_AllLive, data_temp_Status_SomeLive, data_temp_Status_Live, data_temp_MinLiveDate, data_temp_merge_Status_Live)
+```
+
+Status Dead to Live:
+
+Trees change status from D to L over time.
+
+Filter for Status = L. Check that the sample event date is not later than the death date.
+
+NOTE: Error log will consolidate errors by Tag Number and Plot. This is needed because it flags every instance of the specific tree, not just the read where it became alive again. Functionally, it still achieves the desired objective and the consolidation code cleans up the error log data frame, but it does not highlight the specific year in which the tree "resurrected". The "MinDeadDate" is the starting point. Usually the very next read is where the tree was marked as "Live" once more, but this may not be the case across all plots and reads. For future users: ignore the number in parentheses.
+
+```{r}
+# Set parameters 
+#data <- merge(Trees_data, data_temp_merge_Status, all = T) %>% 
+  #filter(Status == "L")
+data <- (data_temp_merge_Status) %>% filter(Status == "L") 
+query <- "Trees Status" 
+query_message <- paste0("Tag ", data$TagNo, ": Status = ", data$Status, ". ", "Death date")
+values_data <- (data$MinDeadDate)
+values_valid <- (data$Date)
+values_check <- (values_data >= values_valid) %>% replace_na(TRUE)
+
+# Identify errors
+errors_Trees_CrossYear_Status <- qaqc(data, query, query_message, values_check)
+```
+
+## Trees Error Log
+
+```{r}
+# Save to master error list
+errors_Trees <- rbind(errors_Trees_MacroPlotSize, errors_Trees_SnagPlotSize, errors_Trees_BrkPntDia, errors_Trees_FieldTeam, errors_Trees_QTRNum, errors_Trees_PosTag, errors_Trees_Status, errors_Trees_DBH, errors_Trees_Ht, errors_Trees_LiCrBHt, errors_Trees_CrwnCl, errors_Trees_CharHt, errors_Trees_ScorchHt, errors_Trees_CrScPct, errors_Trees_DamCds, errors_Trees_DupTag, errors_Trees_CrossYear_Status)
+
+
+```
+
+```{r}
+#remove all the error data frames
+remove(errors_Trees_MacroPlotSize, errors_Trees_SnagPlotSize, errors_Trees_BrkPntDia, errors_Trees_FieldTeam, errors_Trees_QTRNum, errors_Trees_PosTag, errors_Trees_Status, errors_Trees_DBH, errors_Trees_Ht, errors_Trees_LiCrBHt, errors_Trees_CrwnCl, errors_Trees_CharHt, errors_Trees_ScorchHt, errors_Trees_CrScPct, errors_Trees_DamCds, errors_Trees_DupTag, errors_Trees_CrossYear_Status)
+```
+
+## Final Exports
+
+```{r}
+# Add columns to our data sheets
+
+errors_FuelsFWD_export <- errors_FuelsFWD%>%
+  mutate(
+    True_Error = "",
+    Validated_by = "",
+    Fixed = "",
+    Fixed_by = "")
+
+errors_Fuels1000_export <- errors_Fuels1000 %>%
+  mutate(
+    True_Error = "",
+    Validated_by = "",
+    Fixed = "",
+    Fixed_by = "")
+
+errors_Fuels_DuffLitt_export <- errors_Fuels_DuffLitt %>%
+  mutate(
+    True_Error = "",
+    Validated_by = "",
+    Fixed = "",
+    Fixed_by = "")
+
+errors_PostBurn_export <- errors_PostBurn %>%
+  mutate(
+    True_Error = "",
+    Validated_by = "",
+    Fixed = "",
+    Fixed_by = "")
+
+errors_Seedlings_export <- errors_Seedlings %>%
+  mutate(
+    True_Error = "",
+    Validated_by = "",
+    Fixed = "",
+    Fixed_by = "")
+
+errors_Trees_export <- errors_Trees %>%
+  mutate(
+    True_Error = "",
+    Validated_by = "",
+    Fixed = "",
+    Fixed_by = "")
+
+
+# Save as an excel
+
+write_xlsx(
+  list(
+    "Fuels FWD" = errors_FuelsFWD_export,
+    "Fuels 1000s" = errors_Fuels1000_export,
+    "Litter Duff" = errors_Fuels_DuffLitt_export,
+    "Post Burn" = errors_PostBurn_export,
+    "Seedlings" = errors_Seedlings_export,
+    "Trees" = errors_Trees_export
+  ),
+  path = "/Users/sophiedua/Desktop/SEKI Winter Fellowship/R/2026 SEKI Winter Fellows/output/QAQC_Errors_All_Protocols.xlsx"
+)
+
+
+```
